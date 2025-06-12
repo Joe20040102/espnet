@@ -85,8 +85,45 @@ class MambaV1EncoderLayer(nn.Module):
         )
         self.norm_cls = partial(
             nn.LayerNorm if not rms_norm else RMSNorm,
+            eps=norm_epsilon,
+            **factory_kwargs,
         )
-        
+        self.block = Block(
+            d_model,
+            self.mixer_cls,
+            norm_cls=self.norm_cls,
+            fused_add_norm=fused_add_norm,
+            residual_in_fp32=residual_in_fp32,
+        )
+    
+    def forward(
+        self,
+        hidden_states,
+        residual=None,
+        mask=None,
+        inference_params=None,
+        flip_fn=None,
+    ):
+        # If the previous module supplies a tuple (x, pos_emb), separate it here
+        if isinstance(hidden_states, tuple):
+            x, pos_emb = hidden_states
+        else:
+            x, pos_emb = hidden_states, None
+
+        # Main Mamba block computation
+        x, residual = self.block(
+            x,
+            residual,
+            mask,
+            inference_params,
+            flip_fn=flip_fn,
+        )
+
+        # Re‑pack the positional embedding so that downstream layers keep seeing it
+        hidden_states_out = (x, pos_emb) if pos_emb is not None else x
+
+        # Return values: hidden_states, residual (needed by next layer), and mask
+        return hidden_states_out, residual, mask
 
 
 class MaconvEncoder(AbsEncoder):
@@ -131,7 +168,6 @@ class MaconvEncoder(AbsEncoder):
         output_size: int = 256,
         num_blocks: int = 6,
         dropout_rate: float = 0.1,
-        pos_enc_dropout_rate: float = 0.1,
         positional_dropout_rate: float = 0.1, # added
         input_layer: Optional[str] = "conv2d",
         padding_idx: int = -1,
@@ -145,6 +181,10 @@ class MaconvEncoder(AbsEncoder):
         activation_type: str = "swish", # added
         max_pos_emb_len: int = 5000, # added
         ctc_trim: bool = False, # added
+        linear_units: int = 2048, # added
+        normalize_before: bool = True, # added
+        positionwise_layer_type: str = "linear", # added
+        positionwise_conv_kernel_size: int = 3, # added
         fused_add_norm: bool = False,
         residual_in_fp32: bool = False,
         interctc_layer_idx: List[int]=[],
@@ -241,6 +281,35 @@ class MaconvEncoder(AbsEncoder):
             )
         else:
             raise ValueError("unknown input_layer: " + input_layer)
+        
+        self.normalize_before = normalize_before
+        if positionwise_layer_type == "linear":
+            positionwise_layer = PositionwiseFeedForward
+            positionwise_layer_args = (
+                output_size,
+                linear_units,
+                dropout_rate,
+                activation,
+            )
+        elif positionwise_layer_type == "conv1d":
+            positionwise_layer = MultiLayeredConv1d
+            positionwise_layer_args = (
+                output_size,
+                linear_units,
+                positionwise_conv_kernel_size,
+                dropout_rate,
+            )
+        elif positionwise_layer_type == "conv1d-linear":
+            positionwise_layer = Conv1dLinear
+            positionwise_layer_args = (
+                output_size,
+                linear_units,
+                positionwise_conv_kernel_size,
+                dropout_rate,
+            )
+        else:
+            raise NotImplementedError("Support only linear or conv1d.")
+        
         
         self.encoders = repeat(
             num_blocks,
@@ -355,7 +424,7 @@ class MaconvEncoder(AbsEncoder):
         
         if len(self.interctc_layer_idx) == 0:
             for layer_idx, encoder_layer in enumerate(self.encoders):
-                xs_pad, masks = encoder_layer(xs_pad, masks)
+                xs_pad, _, masks = encoder_layer(xs_pad, mask=masks)
                 if return_all_hs:
                     if isinstance(xs_pad, tuple):
                         intermediate_outs.append(xs_pad[0])
@@ -363,7 +432,7 @@ class MaconvEncoder(AbsEncoder):
                         intermediate_outs.append(xs_pad)
         else:
             for layer_idx, encoder_layer in enumerate(self.encoders):
-                xs_pad, masks = encoder_layer(xs_pad, masks)
+                xs_pad, _, masks = encoder_layer(xs_pad, mask=masks)
 
                 if layer_idx + 1 in self.interctc_layer_idx:
                     encoder_out = xs_pad
@@ -403,10 +472,7 @@ class MaconvEncoder(AbsEncoder):
         if self.normalize_before:
             xs_pad = self.after_norm(xs_pad)
 
-        if self.is_causal:
-            olens = masks[:, :, 0].sum(-1)
-        else:
-            olens = masks.squeeze(1).sum(1)
+        olens = masks.squeeze(1).sum(1)
 
         if len(intermediate_outs) > 0:
             return (xs_pad, intermediate_outs), olens, None
